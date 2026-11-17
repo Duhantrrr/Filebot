@@ -312,6 +312,8 @@ async def merge_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def file_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
+    
+    # Callback'i hemen yanıtla
     await query.answer("Merging files, please wait...")
 
     data = query.data
@@ -322,13 +324,13 @@ async def file_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     file_type_str = data.replace("type_", "")
-    await query.edit_message_text("⏳ Processing and merging all lines into one document...")
+    status_msg = await query.edit_message_text("⏳ Processing and merging all lines into one document...")
 
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT file_content FROM merge_queue WHERE admin_id = $1", user_id)
 
     if not rows:
-        await query.edit_message_text("❌ Queue expired or empty.")
+        await status_msg.edit_text("❌ Queue expired or empty.")
         return
 
     try:
@@ -342,19 +344,20 @@ async def file_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
         total_lines = combined_text.count('\n')
         formatted_name = f"@RatLogsCloud-{total_lines}-{file_type_str}.txt"
 
-        # Byte formatına çevir ve imleci başa sar (SEEK 0 ÇOK ÖNEMLİDİR)
         raw_bytes = combined_text.encode('utf-8')
         file_bytes = BytesIO(raw_bytes)
         file_bytes.name = formatted_name
         file_bytes.seek(0)
 
-        # Telegram'a belge olarak gönder
+        # Telegram'a gönder
         sent_msg = await context.bot.send_document(
             chat_id=user_id,
             document=file_bytes,
             filename=formatted_name,
             caption=f"📁 <b>Merged File:</b> <code>{formatted_name}</code>\n📊 <b>Total Lines:</b> <code>{total_lines:,}</code>",
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
+            read_timeout=60,
+            write_timeout=60
         )
         
         telegram_file_id = sent_msg.document.file_id
@@ -362,10 +365,9 @@ async def file_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     except Exception as e:
         logger.error(f"Failed to merge/send file: {e}", exc_info=True)
-        await query.edit_message_text(f"❌ Error while creating document: <code>{html.escape(str(e))}</code>", parse_mode=ParseMode.HTML)
+        await status_msg.edit_text(f"❌ Error: <code>{html.escape(str(e))}</code>", parse_mode=ParseMode.HTML)
         return
 
-    # Veritabanına kaydet
     file_code = secrets.token_urlsafe(6)
 
     async with db_pool.acquire() as conn:
@@ -374,7 +376,6 @@ async def file_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
             VALUES ($1, $2, $3, $4, $5, $6, 0, $7, 1)
         """, file_code, user_id, telegram_file_id, 'document', formatted_name, file_size, formatted_name)
 
-        # Kuyruğu temizle
         await conn.execute("DELETE FROM merge_queue WHERE admin_id = $1", user_id)
 
     bot_username = context.bot.username
@@ -392,7 +393,13 @@ async def file_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
         [InlineKeyboardButton("🔗 Share on Telegram", url=f"https://t.me/share/url?url={download_url}&text=Download%20File")]
     ])
 
-    await query.message.reply_text(resp, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await context.bot.send_message(
+        chat_id=user_id,
+        text=resp,
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
+    )
 
 
 # ==============================================================================
@@ -463,9 +470,13 @@ async def main():
     
     application.add_handler(MessageHandler(filters.Document.ALL & filters.User(user_id=ADMIN_IDS), handle_incoming_file))
 
-    logger.info("🚀 Bot started successfully with /merge command!")
     await application.initialize()
     await application.start()
+
+    # Önceki webhook'u kesin olarak sil ve çakışmaları engelle
+    await application.bot.delete_webhook(drop_pending_updates=True)
+    logger.info("🚀 Webhook dropped & Bot polling started successfully!")
+
     await application.updater.start_polling(drop_pending_updates=True)
     
     stop_signal = asyncio.Event()
