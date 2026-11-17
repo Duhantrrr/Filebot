@@ -3,6 +3,7 @@ import html
 import secrets
 import asyncio
 import logging
+from io import BytesIO
 from contextlib import asynccontextmanager
 
 import asyncpg
@@ -30,7 +31,7 @@ DEFAULT_DB_URL = "postgresql://neondb_owner:npg_BZpD1wXYWQ7u@ep-sweet-meadow-bd0
 RAW_DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DB_URL)
 DATABASE_URL = RAW_DATABASE_URL.replace("&channel_binding=require", "").replace("?channel_binding=require", "")
 
-# 📢 MANDATORY CHANNELS (Optional, e.g., ["@mychannel"])
+# 📢 MANDATORY CHANNELS (Optional)
 REQUIRED_CHANNELS = [] 
 
 logging.basicConfig(level=logging.INFO)
@@ -39,13 +40,9 @@ logger = logging.getLogger(__name__)
 db_pool: asyncpg.Pool | None = None
 ptb_app: Application | None = None
 
-# In-memory storage for collecting files before merging (Per Admin ID)
-# Format: { admin_id: [ {content: str, lines: int}, ... ] }
-MERGE_SESSIONS = {}
-
 
 # ==============================================================================
-# 🗄️ DATABASE
+# 🗄️ DATABASE (Persist, won't delete on code updates)
 # ==============================================================================
 async def init_db():
     global db_pool
@@ -73,16 +70,22 @@ async def init_db():
                 is_active INTEGER DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+            -- Permanent Database-backed Merge Queue for 140k+ lines support
+            CREATE TABLE IF NOT EXISTS merge_queue (
+                id SERIAL PRIMARY KEY,
+                admin_id BIGINT NOT NULL,
+                file_content TEXT NOT NULL,
+                line_count INT NOT NULL,
+                file_name TEXT
+            );
             CREATE INDEX IF NOT EXISTS idx_file_code ON files(file_code);
+            CREATE INDEX IF NOT EXISTS idx_merge_admin ON merge_queue(admin_id);
         """)
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-# ==============================================================================
-# 🔐 FORCE SUBSCRIBE CHECK
-# ==============================================================================
 async def check_channels(user_id: int, bot) -> list:
     if not REQUIRED_CHANNELS:
         return []
@@ -112,7 +115,6 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ON CONFLICT (user_id) DO UPDATE SET username = $2, first_name = $3
         """, user.id, user.username, user.first_name)
 
-    # Mandatory Channel Check
     not_joined = await check_channels(user.id, bot)
     if not_joined:
         buttons = [[InlineKeyboardButton(f"📢 Join Channel", url=f"https://t.me/{ch.replace('@', '')}")] for ch in not_joined]
@@ -124,7 +126,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Deep-link (/start file_ABC123)
+    # Deep-link download
     if context.args and len(context.args) > 0 and context.args[0].startswith("file_"):
         file_code = context.args[0].replace("file_", "")
         
@@ -159,11 +161,10 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_voice(file_id, caption=full_caption, parse_mode=ParseMode.HTML)
         return
 
-    # Normal /start
     if is_admin(user.id):
         text = (
             f"👑 Welcome Boss <b>{html.escape(user.first_name)}</b>!\n\n"
-            "📁 Send me `.txt` files to add them to your merge queue.\n"
+            "📁 Send me your `.txt` files to add them to your permanent merge queue (Supports 140k+ lines).\n"
             "⚙️ Use /admin for control panel."
         )
     else:
@@ -185,7 +186,7 @@ async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ==============================================================================
-# 📂 MULTI-FILE COLLECTION & MERGING HANDLERS
+# 📂 ROBUST 140K+ FILE MERGING QUEUE (Database-backed)
 # ==============================================================================
 
 async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -200,40 +201,40 @@ async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYP
         await msg.reply_text("⚠️ Please send a valid `.txt` file.")
         return
 
+    status_msg = await msg.reply_text("⏳ Downloading and analyzing file lines...")
+
     try:
         file_obj = await context.bot.get_file(document.file_id)
         file_bytes = await file_obj.download_as_bytearray()
+        
+        # High performance line counting and decoding for huge files (140k+)
         text_content = file_bytes.decode('utf-8', errors='ignore')
-        line_count = len(text_content.splitlines())
+        line_count = text_content.count('\n') + (1 if text_content and not text_content.endswith('\n') else 0)
     except Exception as e:
         logger.error(f"Error reading file: {e}")
-        await msg.reply_text("❌ Error reading the file.")
+        await status_msg.edit_text("❌ Error reading the file. Make sure it's a valid text file.")
         return
 
-    # Initialize session list for admin if not exists
-    if user.id not in MERGE_SESSIONS:
-        MERGE_SESSIONS[user.id] = []
+    # Save to Database merge queue (Safe against code updates and restarts)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO merge_queue (admin_id, file_content, line_count, file_name)
+            VALUES ($1, $2, $3, $4)
+        """, user.id, text_content, line_count, document.file_name or "file.txt")
 
-    # Append to session
-    MERGE_SESSIONS[user.id].append({
-        'content': text_content,
-        'lines': line_count,
-        'name': document.file_name or "file.txt"
-    })
-
-    total_files = len(MERGE_SESSIONS[user.id])
-    total_lines = sum(f['lines'] for f in MERGE_SESSIONS[user.id])
+        total_files = await conn.fetchval("SELECT COUNT(*) FROM merge_queue WHERE admin_id = $1", user.id)
+        total_lines = await conn.fetchval("SELECT COALESCE(SUM(line_count), 0) FROM merge_queue WHERE admin_id = $1", user.id)
 
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Merge & Create Link", callback_data="merge_done")],
         [InlineKeyboardButton("🗑️ Clear Queue", callback_data="merge_clear")]
     ])
 
-    await msg.reply_text(
-        f"📄 <b>File Added to Queue!</b>\n"
+    await status_msg.edit_text(
+        f"📄 <b>File Added to Permanent Queue!</b>\n"
         f"➕ File Lines: <code>{line_count}</code>\n"
         f"📦 Total Files in Queue: <b>{total_files}</b>\n"
-        f"📊 Total Combined Lines: <b>{total_lines}</b>\n\n"
+        f"📊 Total Combined Lines: <b>{total_lines:,}</b>\n\n"
         f"Send more files or click <b>Merge & Create Link</b> when ready:",
         reply_markup=kb,
         parse_mode=ParseMode.HTML
@@ -250,17 +251,20 @@ async def merge_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data == "merge_clear":
-        MERGE_SESSIONS.pop(user_id, None)
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM merge_queue WHERE admin_id = $1", user_id)
         await query.edit_message_text("🗑️ Merge queue cleared.")
         return
 
     if data == "merge_done":
-        session_files = MERGE_SESSIONS.get(user_id, [])
-        if not session_files:
+        async with db_pool.acquire() as conn:
+            total_files = await conn.fetchval("SELECT COUNT(*) FROM merge_queue WHERE admin_id = $1", user_id)
+            total_lines = await conn.fetchval("SELECT COALESCE(SUM(line_count), 0) FROM merge_queue WHERE admin_id = $1", user_id)
+
+        if not total_files or total_files == 0:
             await query.edit_message_text("⚠️ Your queue is empty!")
             return
 
-        # Show type selection keyboard
         kb = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("🔥 HOTMAIL", callback_data="type_HOTMAIL"),
@@ -273,11 +277,9 @@ async def merge_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("❌ Cancel", callback_data="type_cancel")]
         ])
 
-        total_lines = sum(f['lines'] for f in session_files)
         await query.edit_message_text(
-            f"🔗 <b>Ready to Merge!</b>\n"
-            f"📊 Total Files: {len(session_files)}\n"
-            f"📏 Total Lines: <b>{total_lines}</b>\n\n"
+            f"🔗 <b>Ready to Merge {total_files} Files!</b>\n"
+            f"📊 Total Lines: <b>{total_lines:,}</b>\n\n"
             f"Select the final log type:",
             reply_markup=kb,
             parse_mode=ParseMode.HTML
@@ -291,26 +293,30 @@ async def file_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     data = query.data
     if data == "type_cancel":
-        MERGE_SESSIONS.pop(user_id, None)
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM merge_queue WHERE admin_id = $1", user_id)
         await query.edit_message_text("❌ Operation cancelled.")
         return
 
-    file_type_str = data.replace("type_", "") # HOTMAIL, MIX, etc.
-    session_files = MERGE_SESSIONS.get(user_id, [])
+    file_type_str = data.replace("type_", "")
+    
+    await query.edit_message_text("⏳ Merging large files and generating final link... Please wait.")
 
-    if not session_files:
-        await query.edit_message_text("❌ Session expired or queue is empty.")
+    # Fetch all queued files for this admin from DB
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT file_content, line_count FROM merge_queue WHERE admin_id = $1", user_id)
+
+    if not rows:
+        await query.edit_message_text("❌ Queue expired or empty.")
         return
 
-    # Combine all file contents into one text
-    combined_content = "\n".join([f['content'] for f in session_files])
-    total_lines = sum(f['lines'] for f in session_files)
+    # High performance combination using list join (Optimized for 140k+ lines)
+    all_contents = [row['file_content'] for row in rows]
+    combined_content = "\n".join(all_contents)
+    total_lines = sum(row['line_count'] for row in rows)
 
-    # Format: @RatLogsCloud-[TOTAL_LINES]-TYPE
     formatted_name = f"@RatLogsCloud-{total_lines}-{file_type_str}.txt"
 
-    # Upload combined content as a Telegram document using BytesIO
-    from io import BytesIO
     file_bytes = BytesIO(combined_content.encode('utf-8'))
     file_bytes.name = formatted_name
 
@@ -323,20 +329,21 @@ async def file_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
         telegram_file_id = sent_msg.document.file_id
         file_size = sent_msg.document.file_size or len(combined_content)
     except Exception as e:
-        logger.error(f"Failed to send merged file to telegram: {e}")
-        await query.edit_message_text("❌ Failed to generate merged file.")
+        logger.error(f"Failed to send merged file: {e}")
+        await query.edit_message_text("❌ Failed to generate combined document.")
         return
 
     file_code = secrets.token_urlsafe(6)
 
     async with db_pool.acquire() as conn:
+        # Save to permanent files table
         await conn.execute("""
             INSERT INTO files (file_code, user_id, file_id, file_type, file_name, file_size, download_count, caption, is_active)
             VALUES ($1, $2, $3, $4, $5, $6, 0, $7, 1)
         """, file_code, user_id, telegram_file_id, 'document', formatted_name, file_size, formatted_name)
 
-    # Clear session after successful creation
-    MERGE_SESSIONS.pop(user_id, None)
+        # Clear merge queue after success
+        await conn.execute("DELETE FROM merge_queue WHERE admin_id = $1", user_id)
 
     bot_username = context.bot.username
     download_url = f"https://t.me/{bot_username}?start=file_{file_code}"
@@ -345,7 +352,7 @@ async def file_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
     resp = (
         "✅ <b>Files Successfully Merged & Link Created!</b>\n\n"
         f"🏷️ File Name: <code>{formatted_name}</code>\n"
-        f"📊 Size: <code>{size_mb} MB</code> | Total Lines: <code>{total_lines}</code>\n\n"
+        f"📊 Size: <code>{size_mb} MB</code> | Total Lines: <code>{total_lines:,}</code>\n\n"
         f"🔗 <b>Download Link:</b>\n<code>{download_url}</code>"
     )
 
@@ -416,11 +423,9 @@ async def lifespan(app: FastAPI):
     ptb_app.add_handler(CallbackQueryHandler(check_sub_callback, pattern="^check_sub$"))
     ptb_app.add_handler(CallbackQueryHandler(admin_callback))
     
-    # Merge and type selection handlers
     ptb_app.add_handler(CallbackQueryHandler(merge_callbacks, pattern="^merge_"))
     ptb_app.add_handler(CallbackQueryHandler(file_type_selected, pattern="^type_"))
     
-    # Incoming files handler
     ptb_app.add_handler(MessageHandler(filters.Document.ALL & filters.User(user_id=ADMIN_IDS), handle_incoming_file))
 
     await ptb_app.initialize()
@@ -435,7 +440,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def home():
-    return {"status": "active", "bot": "Log Share & Merge Bot Running 24/7"}
+    return {"status": "active", "bot": "Log Share & 140k Merge Bot Running 24/7"}
 
 @app.post("/api/webhook")
 async def telegram_webhook(request: Request):
