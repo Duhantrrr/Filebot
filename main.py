@@ -38,7 +38,7 @@ db_pool: asyncpg.Pool | None = None
 
 
 # ==============================================================================
-# 🗄️ DATABASE
+# 🗄️ DATABASE (Otomatik Sütun Güncelleyicili)
 # ==============================================================================
 async def init_db():
     global db_pool
@@ -46,6 +46,7 @@ async def init_db():
         db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, statement_cache_size=0)
     
     async with db_pool.acquire() as conn:
+        # Tabloları oluştur
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
@@ -73,9 +74,16 @@ async def init_db():
                 line_count INT NOT NULL,
                 file_name TEXT
             );
-            CREATE INDEX IF NOT EXISTS idx_file_code ON files(file_code);
-            CREATE INDEX IF NOT EXISTS idx_merge_admin ON merge_queue(admin_id);
         """)
+        
+        # Eski tablolarda eksik olabilecek sütunları otomatik ekle (Migration)
+        await conn.execute("""
+            ALTER TABLE files ADD COLUMN IF NOT EXISTS download_count INT DEFAULT 0;
+            ALTER TABLE files ADD COLUMN IF NOT EXISTS is_active INT DEFAULT 1;
+        """)
+        
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_file_code ON files(file_code);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_merge_admin ON merge_queue(admin_id);")
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -431,7 +439,7 @@ async def main():
 
     application.add_handler(CommandHandler("start", start_handler))
     application.add_handler(CommandHandler("admin", admin_panel))
-    application.add_handler(CommandHandler("merge", merge_command_handler))  # Yeni /merge komutu
+    application.add_handler(CommandHandler("merge", merge_command_handler))
     
     application.add_handler(CallbackQueryHandler(check_sub_callback, pattern="^check_sub$"))
     application.add_handler(CallbackQueryHandler(admin_callback))
