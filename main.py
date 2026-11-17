@@ -5,6 +5,7 @@ import asyncio
 import logging
 from io import BytesIO, StringIO
 import asyncpg
+from aiohttp import web
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -158,6 +159,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             f"👑 Welcome Boss <b>{html.escape(user.first_name)}</b>!\n\n"
             "📁 Send me your `.txt` files to add them to your permanent merge queue.\n"
+            "🔗 When you're done, type <b>/merge</b> to combine them and get the link.\n"
             "⚙️ Use /admin for control panel."
         )
     else:
@@ -179,7 +181,7 @@ async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ==============================================================================
-# 📂 FILE QUEUE & MERGE HANDLERS
+# 📂 FILE QUEUE & /merge COMMAND
 # ==============================================================================
 
 async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -194,7 +196,7 @@ async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYP
         await msg.reply_text("⚠️ Please send a valid `.txt` file.")
         return
 
-    status_msg = await msg.reply_text("⏳ Downloading and analyzing file lines...")
+    status_msg = await msg.reply_text("⏳ Analyzing file...")
 
     try:
         file_obj = await context.bot.get_file(document.file_id)
@@ -204,7 +206,7 @@ async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYP
         line_count = text_content.count('\n') + (1 if text_content and not text_content.endswith('\n') else 0)
     except Exception as e:
         logger.error(f"Error reading file: {e}")
-        await status_msg.edit_text("❌ Error reading the file. Make sure it's a valid text file.")
+        await status_msg.edit_text("❌ Error reading the file.")
         return
 
     async with db_pool.acquire() as conn:
@@ -217,16 +219,49 @@ async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYP
         total_lines = await conn.fetchval("SELECT COALESCE(SUM(line_count), 0) FROM merge_queue WHERE admin_id = $1", user.id)
 
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Merge & Create Link", callback_data="merge_done")],
         [InlineKeyboardButton("🗑️ Clear Queue", callback_data="merge_clear")]
     ])
 
     await status_msg.edit_text(
-        f"📄 <b>File Added to Permanent Queue!</b>\n"
-        f"➕ File Lines: <code>{line_count:,}</code>\n"
+        f"✅ <b>File Added to Queue!</b>\n"
+        f"➕ Lines: <code>{line_count:,}</code>\n"
         f"📦 Total Files in Queue: <b>{total_files}</b>\n"
         f"📊 Total Combined Lines: <b>{total_lines:,}</b>\n\n"
-        f"Send more files or click <b>Merge & Create Link</b> when ready:",
+        f"👉 Send more files or type <b>/merge</b> to combine them.",
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML
+    )
+
+
+async def merge_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+
+    async with db_pool.acquire() as conn:
+        total_files = await conn.fetchval("SELECT COUNT(*) FROM merge_queue WHERE admin_id = $1", user.id)
+        total_lines = await conn.fetchval("SELECT COALESCE(SUM(line_count), 0) FROM merge_queue WHERE admin_id = $1", user.id)
+
+    if not total_files or total_files == 0:
+        await update.message.reply_text("⚠️ Your merge queue is empty! Send some `.txt` files first.")
+        return
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔥 HOTMAIL", callback_data="type_HOTMAIL"),
+            InlineKeyboardButton("⚡ MIX", callback_data="type_MIX")
+        ],
+        [
+            InlineKeyboardButton("🌐 YANDEX", callback_data="type_YANDEX"),
+            InlineKeyboardButton("📦 LOGS", callback_data="type_LOGS")
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data="type_cancel")]
+    ])
+
+    await update.message.reply_text(
+        f"🔗 <b>Ready to Merge {total_files} Files!</b>\n"
+        f"📊 Total Lines: <b>{total_lines:,}</b>\n\n"
+        f"Select the final log type:",
         reply_markup=kb,
         parse_mode=ParseMode.HTML
     )
@@ -245,36 +280,6 @@ async def merge_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with db_pool.acquire() as conn:
             await conn.execute("DELETE FROM merge_queue WHERE admin_id = $1", user_id)
         await query.edit_message_text("🗑️ Merge queue cleared.")
-        return
-
-    if data == "merge_done":
-        async with db_pool.acquire() as conn:
-            total_files = await conn.fetchval("SELECT COUNT(*) FROM merge_queue WHERE admin_id = $1", user_id)
-            total_lines = await conn.fetchval("SELECT COALESCE(SUM(line_count), 0) FROM merge_queue WHERE admin_id = $1", user_id)
-
-        if not total_files or total_files == 0:
-            await query.edit_message_text("⚠️ Your queue is empty!")
-            return
-
-        kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🔥 HOTMAIL", callback_data="type_HOTMAIL"),
-                InlineKeyboardButton("⚡ MIX", callback_data="type_MIX")
-            ],
-            [
-                InlineKeyboardButton("🌐 YANDEX", callback_data="type_YANDEX"),
-                InlineKeyboardButton("📦 LOGS", callback_data="type_LOGS")
-            ],
-            [InlineKeyboardButton("❌ Cancel", callback_data="type_cancel")]
-        ])
-
-        await query.edit_message_text(
-            f"🔗 <b>Ready to Merge {total_files} Files!</b>\n"
-            f"📊 Total Lines: <b>{total_lines:,}</b>\n\n"
-            f"Select the final log type:",
-            reply_markup=kb,
-            parse_mode=ParseMode.HTML
-        )
 
 
 async def file_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -290,7 +295,7 @@ async def file_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     file_type_str = data.replace("type_", "")
-    await query.edit_message_text("⏳ Merging large files safely and generating final link... Please wait.")
+    await query.edit_message_text("⏳ Merging files securely and generating link... Please wait.")
 
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT file_content FROM merge_queue WHERE admin_id = $1", user_id)
@@ -399,15 +404,35 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==============================================================================
-# 🚀 MAIN RUNNER (Long Polling for Render)
+# 🌐 RENDER PORT KANDIRMASI
+# ==============================================================================
+async def handle_ping(request):
+    return web.Response(text="Bot is running 24/7!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"🌐 Dummy web server started on port {port}")
+
+
+# ==============================================================================
+# 🚀 MAIN RUNNER
 # ==============================================================================
 async def main():
     await init_db()
+    await start_web_server()
 
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_handler))
     application.add_handler(CommandHandler("admin", admin_panel))
+    application.add_handler(CommandHandler("merge", merge_command_handler))  # Yeni /merge komutu
+    
     application.add_handler(CallbackQueryHandler(check_sub_callback, pattern="^check_sub$"))
     application.add_handler(CallbackQueryHandler(admin_callback))
     
@@ -416,12 +441,11 @@ async def main():
     
     application.add_handler(MessageHandler(filters.Document.ALL & filters.User(user_id=ADMIN_IDS), handle_incoming_file))
 
-    logger.info("🚀 Bot started with Long Polling on Render!")
+    logger.info("🚀 Bot started successfully with /merge command!")
     await application.initialize()
     await application.start()
     await application.updater.start_polling(drop_pending_updates=True)
     
-    # Keep the script running
     stop_signal = asyncio.Event()
     await stop_signal.wait()
 
