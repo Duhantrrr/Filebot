@@ -313,7 +313,6 @@ async def file_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     user_id = query.from_user.id
     
-    # Callback'i hemen yanıtla
     await query.answer("Merging files, please wait...")
 
     data = query.data
@@ -462,9 +461,9 @@ async def main():
     application.add_handler(CommandHandler("admin", admin_panel))
     application.add_handler(CommandHandler("merge", merge_command_handler))
     
+    # DÜZELTİLEN YER: Buton filtreleri kesinleştirildi
     application.add_handler(CallbackQueryHandler(check_sub_callback, pattern="^check_sub$"))
-    application.add_handler(CallbackQueryHandler(admin_callback))
-    
+    application.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin_"))
     application.add_handler(CallbackQueryHandler(merge_callbacks, pattern="^merge_"))
     application.add_handler(CallbackQueryHandler(file_type_selected, pattern="^type_"))
     
@@ -473,7 +472,6 @@ async def main():
     await application.initialize()
     await application.start()
 
-    # Önceki webhook'u kesin olarak sil ve çakışmaları engelle
     await application.bot.delete_webhook(drop_pending_updates=True)
     logger.info("🚀 Webhook dropped & Bot polling started successfully!")
 
