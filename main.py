@@ -3,9 +3,10 @@ import html
 import secrets
 import asyncio
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from io import BytesIO, StringIO
 import asyncpg
-from aiohttp import web
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -38,7 +39,27 @@ db_pool: asyncpg.Pool | None = None
 
 
 # ==============================================================================
-# 🗄️ DATABASE (Otomatik Sütun Güncelleyicili)
+# 🌐 RENDER PORT KANDIRMASI (Python Standart Kütüphanesi İle - Kurulum İstemez)
+# ==============================================================================
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Bot is running 24/7!")
+
+    def log_message(self, format, *args):
+        return  # Log kirliliğini engeller
+
+def run_dummy_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), SimpleHandler)
+    logger.info(f"🌐 Native dummy web server running on port {port}")
+    server.serve_forever()
+
+
+# ==============================================================================
+# 🗄️ DATABASE (Otomatik Tablo Güncelleyici)
 # ==============================================================================
 async def init_db():
     global db_pool
@@ -46,7 +67,6 @@ async def init_db():
         db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, statement_cache_size=0)
     
     async with db_pool.acquire() as conn:
-        # Tabloları oluştur
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
@@ -76,7 +96,6 @@ async def init_db():
             );
         """)
         
-        # Eski tablolarda eksik olabilecek sütunları otomatik ekle (Migration)
         await conn.execute("""
             ALTER TABLE files ADD COLUMN IF NOT EXISTS download_count INT DEFAULT 0;
             ALTER TABLE files ADD COLUMN IF NOT EXISTS is_active INT DEFAULT 1;
@@ -412,28 +431,14 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==============================================================================
-# 🌐 RENDER PORT KANDIRMASI
-# ==============================================================================
-async def handle_ping(request):
-    return web.Response(text="Bot is running 24/7!")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get("/", handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logger.info(f"🌐 Dummy web server started on port {port}")
-
-
-# ==============================================================================
 # 🚀 MAIN RUNNER
 # ==============================================================================
 async def main():
     await init_db()
-    await start_web_server()
+
+    # Python'ın kendi standart kütüphanesiyle arka planda port aç (Ayrı bir thread ile)
+    server_thread = threading.Thread(target=run_dummy_server, daemon=True)
+    server_thread.start()
 
     application = Application.builder().token(BOT_TOKEN).build()
 
