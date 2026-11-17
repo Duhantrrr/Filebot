@@ -39,7 +39,7 @@ db_pool: asyncpg.Pool | None = None
 
 
 # ==============================================================================
-# 🌐 RENDER PORT KANDIRMASI (Python Standart Kütüphanesi İle - Kurulum İstemez)
+# 🌐 RENDER PORT KANDIRMASI
 # ==============================================================================
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -49,7 +49,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot is running 24/7!")
 
     def log_message(self, format, *args):
-        return  # Log kirliliğini engeller
+        return
 
 def run_dummy_server():
     port = int(os.environ.get("PORT", 10000))
@@ -59,7 +59,7 @@ def run_dummy_server():
 
 
 # ==============================================================================
-# 🗄️ DATABASE (Otomatik Tablo Güncelleyici)
+# 🗄️ DATABASE
 # ==============================================================================
 async def init_db():
     global db_pool
@@ -312,7 +312,7 @@ async def merge_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def file_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
-    await query.answer("Processing files...")
+    await query.answer("Merging files, please wait...")
 
     data = query.data
     if data == "type_cancel":
@@ -322,7 +322,7 @@ async def file_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     file_type_str = data.replace("type_", "")
-    await query.edit_message_text("⏳ Merging files securely and generating link... Please wait.")
+    await query.edit_message_text("⏳ Processing and merging all lines into one document...")
 
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT file_content FROM merge_queue WHERE admin_id = $1", user_id)
@@ -342,21 +342,30 @@ async def file_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
         total_lines = combined_text.count('\n')
         formatted_name = f"@RatLogsCloud-{total_lines}-{file_type_str}.txt"
 
-        file_bytes = BytesIO(combined_text.encode('utf-8'))
+        # Byte formatına çevir ve imleci başa sar (SEEK 0 ÇOK ÖNEMLİDİR)
+        raw_bytes = combined_text.encode('utf-8')
+        file_bytes = BytesIO(raw_bytes)
         file_bytes.name = formatted_name
+        file_bytes.seek(0)
 
+        # Telegram'a belge olarak gönder
         sent_msg = await context.bot.send_document(
             chat_id=user_id,
             document=file_bytes,
-            caption=f"Merged File: {formatted_name}"
+            filename=formatted_name,
+            caption=f"📁 <b>Merged File:</b> <code>{formatted_name}</code>\n📊 <b>Total Lines:</b> <code>{total_lines:,}</code>",
+            parse_mode=ParseMode.HTML
         )
+        
         telegram_file_id = sent_msg.document.file_id
-        file_size = sent_msg.document.file_size or len(combined_text)
+        file_size = sent_msg.document.file_size or len(raw_bytes)
+
     except Exception as e:
-        logger.error(f"Failed to merge files: {e}")
-        await query.edit_message_text(f"❌ Failed to merge files: {str(e)}")
+        logger.error(f"Failed to merge/send file: {e}", exc_info=True)
+        await query.edit_message_text(f"❌ Error while creating document: <code>{html.escape(str(e))}</code>", parse_mode=ParseMode.HTML)
         return
 
+    # Veritabanına kaydet
     file_code = secrets.token_urlsafe(6)
 
     async with db_pool.acquire() as conn:
@@ -365,6 +374,7 @@ async def file_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
             VALUES ($1, $2, $3, $4, $5, $6, 0, $7, 1)
         """, file_code, user_id, telegram_file_id, 'document', formatted_name, file_size, formatted_name)
 
+        # Kuyruğu temizle
         await conn.execute("DELETE FROM merge_queue WHERE admin_id = $1", user_id)
 
     bot_username = context.bot.username
@@ -382,7 +392,7 @@ async def file_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
         [InlineKeyboardButton("🔗 Share on Telegram", url=f"https://t.me/share/url?url={download_url}&text=Download%20File")]
     ])
 
-    await query.edit_message_text(resp, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await query.message.reply_text(resp, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 # ==============================================================================
@@ -436,7 +446,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def main():
     await init_db()
 
-    # Python'ın kendi standart kütüphanesiyle arka planda port aç (Ayrı bir thread ile)
     server_thread = threading.Thread(target=run_dummy_server, daemon=True)
     server_thread.start()
 
