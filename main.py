@@ -9,6 +9,7 @@ from io import BytesIO, StringIO
 import asyncpg
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -19,11 +20,31 @@ from telegram.ext import (
 )
 
 # ==============================================================================
-# ⚙️ AYARLAR
+# 🌐 1. RENDER PORTUNU İLK SANİYEDE AÇ (Render Botu Öldüremesin)
+# ==============================================================================
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Bot is alive 24/7!")
+
+    def log_message(self, format, *args):
+        return  # Log kirliliğini engelle
+
+def start_dummy_port():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), SimpleHandler)
+    server.serve_forever()
+
+# Arka planda portu hemen başlatıyoruz
+threading.Thread(target=start_dummy_port, daemon=True).start()
+
+# ==============================================================================
+# ⚙️ 2. AYARLAR
 # ==============================================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "9183664352:AAHKDCWH0vttkhTzcqUysKXULwtJhx2UGmQ")
 
-# Kendi ID'n tanımlandı
 ADMIN_IDS = [7231282775]
 admin_ids_env = os.getenv("ADMIN_IDS", "")
 if admin_ids_env:
@@ -40,38 +61,24 @@ db_pool: asyncpg.Pool | None = None
 
 
 # ==============================================================================
-# 🌐 RENDER PORT KANDIRMASI
-# ==============================================================================
-class SimpleHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
-        self.end_headers()
-        self.wfile.write(b"Bot is alive!")
-
-    def log_message(self, format, *args):
-        return
-
-def run_dummy_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), SimpleHandler)
-    logger.info(f"🌐 Port {port} dinleniyor...")
-    server.serve_forever()
-
-
-# ==============================================================================
-# 🗄️ VERİTABANI BAĞLANTISI (Kopan Bağlantıyı Otomatik Yeniler)
+# 🗄️ 3. VERİTABANI BAĞLANTISI (Neon Uykudaysa Bekler)
 # ==============================================================================
 async def get_db_pool():
     global db_pool
     if db_pool is None or db_pool._closed:
-        db_pool = await asyncpg.create_pool(
-            DATABASE_URL,
-            min_size=1,
-            max_size=5,
-            statement_cache_size=0,
-            command_timeout=60
-        )
+        while True:
+            try:
+                db_pool = await asyncpg.create_pool(
+                    DATABASE_URL,
+                    min_size=1,
+                    max_size=5,
+                    statement_cache_size=0,
+                    command_timeout=60
+                )
+                break
+            except Exception as e:
+                logger.warning(f"Neon veritabanı uyanıyor... Tekrar deneniyor: {e}")
+                await asyncio.sleep(3)
     return db_pool
 
 async def init_db():
@@ -116,7 +123,7 @@ def is_admin(user_id: int) -> bool:
 
 
 # ==============================================================================
-# 🤖 BOT KOMUTLARI & HANDLER'LAR
+# 🤖 4. BOT HANDLER'LARI
 # ==============================================================================
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -133,7 +140,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Kullanıcı kayıt hatası: {e}")
 
-    # Dosya indirme linki tıklandıysa
+    # İndirme linkine tıklandıysa
     if context.args and len(context.args) > 0 and context.args[0].startswith("file_"):
         file_code = context.args[0].replace("file_", "")
         
@@ -150,8 +157,6 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         file_id = row["file_id"]
         downloads = row["download_count"]
-        filename = row["file_name"]
-
         header_info = f"📥 <b>Bu dosya toplam {downloads} kez indirildi!</b>"
         await update.message.reply_document(file_id, caption=header_info, parse_mode=ParseMode.HTML)
         return
@@ -176,15 +181,13 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gelen dosyaları yakalar"""
     user = update.effective_user
     msg = update.message
 
-    # Admin kontrolü
     if not is_admin(user.id):
         await msg.reply_text(
             f"⛔ <b>Yetkisiz İşlem!</b>\nSenin ID'n: <code>{user.id}</code>\n"
-            f"Bu botta sadece yönetici dosya birleştirebilir.",
+            f"Bu botta sadece yönetici dosya yükleyebilir.",
             parse_mode=ParseMode.HTML
         )
         return
@@ -194,7 +197,7 @@ async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYP
         await msg.reply_text("⚠️ Lütfen bir <code>.txt</code> belgesi gönderin.")
         return
 
-    status_msg = await msg.reply_text("⏳ Dosya indiriliyor ve satırlar sayılıyor...")
+    status_msg = await msg.reply_text("⏳ Dosya inceleniyor...")
 
     try:
         file_obj = await context.bot.get_file(document.file_id)
@@ -233,14 +236,13 @@ async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def merge_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/merge komutu: Dosyaları anında birleştirir"""
     user = update.effective_user
 
     if not is_admin(user.id):
         await update.message.reply_text("⛔ Bu komutu sadece yönetici kullanabilir.")
         return
 
-    status_msg = await update.message.reply_text("⏳ Dosyalar birleştiriliyor, lütfen bekle...")
+    status_msg = await update.message.reply_text("⏳ Dosyalar @CalcyCloud olarak birleştiriliyor...")
 
     pool = await get_db_pool()
     async with pool.acquire() as conn:
@@ -266,15 +268,14 @@ async def merge_command_handler(update: Update, context: ContextTypes.DEFAULT_TY
         file_bytes.name = formatted_name
         file_bytes.seek(0)
 
-        # Telegram'a belgeyi gönder
         sent_msg = await context.bot.send_document(
             chat_id=user.id,
             document=file_bytes,
             filename=formatted_name,
             caption=f"📁 <b>Birleştirilen Dosya:</b> <code>{formatted_name}</code>\n📊 <b>Toplam Satır:</b> <code>{total_lines:,}</code>",
             parse_mode=ParseMode.HTML,
-            read_timeout=120,
-            write_timeout=120
+            read_timeout=180,
+            write_timeout=180
         )
         
         telegram_file_id = sent_msg.document.file_id
@@ -293,7 +294,6 @@ async def merge_command_handler(update: Update, context: ContextTypes.DEFAULT_TY
             VALUES ($1, $2, $3, $4, $5, $6, 0, $7, 1)
         """, file_code, user.id, telegram_file_id, 'document', formatted_name, file_size, formatted_name)
 
-        # Kuyruğu temizle
         await conn.execute("DELETE FROM merge_queue WHERE admin_id = $1", user.id)
 
     bot_username = context.bot.username
@@ -322,7 +322,6 @@ async def merge_command_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def clear_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/clear komutu: Kuyruğu temizler"""
     user = update.effective_user
     if not is_admin(user.id):
         return
@@ -348,65 +347,63 @@ async def merge_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def fallback_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Kullanıcı dosya yerine normal yazı yazarsa uyarır"""
     if update.message and update.message.text:
         text = update.message.text
         if text.startswith("/"):
             return
         await update.message.reply_text(
-            "ℹ️ Lütfen birleştirmek istediğiniz <code>.txt</code> dosyalarını belge (dosya) olarak gönderin.\n"
+            "ℹ️ Lütfen birleştirmek istediğiniz <code>.txt</code> dosyalarını belge olarak gönderin.\n"
             "Birleştirmek için: <b>/merge</b>",
             parse_mode=ParseMode.HTML
         )
 
 
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Botta bir hata çıkarsa Telegram'a yazdırır"""
     logger.error("Global Hata:", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         await update.effective_message.reply_text(
-            f"⚠️ <b>Sistemsel Hata:</b> <code>{html.escape(str(context.error))}</code>",
+            f"⚠️ <b>Hata:</b> <code>{html.escape(str(context.error))}</code>",
             parse_mode=ParseMode.HTML
         )
 
-
-# ==============================================================================
-# 🚀 BAŞLATICI
-# ==============================================================================
-async def main():
+async def post_init(application: Application):
+    """Bot başlarken çalışan kanca"""
     await init_db()
+    await application.bot.delete_webhook(drop_pending_updates=True)
+    logger.info("🚀 Bot hazır, Telegram dinleniyor...")
 
-    # Port için thread
-    server_thread = threading.Thread(target=run_dummy_server, daemon=True)
-    server_thread.start()
 
-    application = Application.builder().token(BOT_TOKEN).build()
+# ==============================================================================
+# 🚀 5. EN SAĞLAM BAŞLATICI (run_polling)
+# ==============================================================================
+def main():
+    t_request = HTTPXRequest(
+        connection_pool_size=16,
+        connect_timeout=60.0,
+        read_timeout=120.0,
+        write_timeout=120.0,
+        pool_timeout=60.0
+    )
 
-    # Hata yakalayıcıyı ekle
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(t_request)
+        .post_init(post_init)
+        .build()
+    )
+
     application.add_error_handler(global_error_handler)
 
     application.add_handler(CommandHandler("start", start_handler))
     application.add_handler(CommandHandler("merge", merge_command_handler))
     application.add_handler(CommandHandler("clear", clear_command_handler))
-    
     application.add_handler(CallbackQueryHandler(merge_callbacks, pattern="^merge_"))
-    
-    # Belgeleri yakala
     application.add_handler(MessageHandler(filters.Document.ALL, handle_incoming_file))
-    # Düz yazıları yakala
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_text_handler))
 
-    await application.initialize()
-    await application.start()
-
-    # Webhook'u sil ve polling başlat
-    await application.bot.delete_webhook(drop_pending_updates=True)
-    logger.info("🚀 Bot dinlemeye başladı!")
-
-    await application.updater.start_polling(drop_pending_updates=True)
-    
-    stop_signal = asyncio.Event()
-    await stop_signal.wait()
+    # Kütüphanenin kendi kendini toparlayan resmi döngüsü
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
