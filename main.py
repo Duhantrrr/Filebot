@@ -148,6 +148,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Deep-link indirmesi
     if context.args and len(context.args) > 0 and context.args[0].startswith("file_"):
         file_code = context.args[0].replace("file_", "")
         
@@ -185,9 +186,9 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(user.id):
         text = (
             f"👑 Welcome Boss <b>{html.escape(user.first_name)}</b>!\n\n"
-            "📁 Send me your `.txt` files to add them to your permanent merge queue.\n"
-            "🔗 When you're done, type <b>/merge</b> to combine them and get the link.\n"
-            "⚙️ Use /admin for control panel."
+            "📁 Send me your `.txt` files.\n"
+            "🔗 When you're ready, simply type <b>/merge</b> to combine them into <code>@CalcyCloud-[LINES].txt</code>.\n"
+            "⚙️ Use /admin for statistics."
         )
     else:
         text = f"👋 Hello <b>{html.escape(user.first_name)}</b>! You can download files using the shared links."
@@ -208,7 +209,7 @@ async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ==============================================================================
-# 📂 FILE QUEUE & /merge COMMAND
+# 📂 DOSYA ALMA & DOĞRUDAN /merge KOMUTU (BUTONSUZ)
 # ==============================================================================
 
 async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -223,7 +224,7 @@ async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYP
         await msg.reply_text("⚠️ Please send a valid `.txt` file.")
         return
 
-    status_msg = await msg.reply_text("⏳ Analyzing file...")
+    status_msg = await msg.reply_text("⏳ Analyzing file lines...")
 
     try:
         file_obj = await context.bot.get_file(document.file_id)
@@ -254,82 +255,25 @@ async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYP
         f"➕ Lines: <code>{line_count:,}</code>\n"
         f"📦 Total Files in Queue: <b>{total_files}</b>\n"
         f"📊 Total Combined Lines: <b>{total_lines:,}</b>\n\n"
-        f"👉 Send more files or type <b>/merge</b> to combine them.",
+        f"👉 Send more files or type <b>/merge</b> to combine them instantly.",
         reply_markup=kb,
         parse_mode=ParseMode.HTML
     )
 
 
 async def merge_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kullanıcı /merge yazdığında HİÇBİR ŞEY SORMADAN direkt birleştirir."""
     user = update.effective_user
     if not is_admin(user.id):
         return
 
-    async with db_pool.acquire() as conn:
-        total_files = await conn.fetchval("SELECT COUNT(*) FROM merge_queue WHERE admin_id = $1", user.id)
-        total_lines = await conn.fetchval("SELECT COALESCE(SUM(line_count), 0) FROM merge_queue WHERE admin_id = $1", user.id)
-
-    if not total_files or total_files == 0:
-        await update.message.reply_text("⚠️ Your merge queue is empty! Send some `.txt` files first.")
-        return
-
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🔥 HOTMAIL", callback_data="type_HOTMAIL"),
-            InlineKeyboardButton("⚡ MIX", callback_data="type_MIX")
-        ],
-        [
-            InlineKeyboardButton("🌐 YANDEX", callback_data="type_YANDEX"),
-            InlineKeyboardButton("📦 LOGS", callback_data="type_LOGS")
-        ],
-        [InlineKeyboardButton("❌ Cancel", callback_data="type_cancel")]
-    ])
-
-    await update.message.reply_text(
-        f"🔗 <b>Ready to Merge {total_files} Files!</b>\n"
-        f"📊 Total Lines: <b>{total_lines:,}</b>\n\n"
-        f"Select the final log type:",
-        reply_markup=kb,
-        parse_mode=ParseMode.HTML
-    )
-
-
-async def merge_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-    if not is_admin(user_id):
-        return
-
-    await query.answer()
-    data = query.data
-
-    if data == "merge_clear":
-        async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM merge_queue WHERE admin_id = $1", user_id)
-        await query.edit_message_text("🗑️ Merge queue cleared.")
-
-
-async def file_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-    
-    await query.answer("Merging files, please wait...")
-
-    data = query.data
-    if data == "type_cancel":
-        async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM merge_queue WHERE admin_id = $1", user_id)
-        await query.edit_message_text("❌ Operation cancelled.")
-        return
-
-    file_type_str = data.replace("type_", "")
-    status_msg = await query.edit_message_text("⏳ Processing and merging all lines into one document...")
+    status_msg = await update.message.reply_text("⏳ Merging all queued files into @CalcyCloud... Please wait.")
 
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT file_content FROM merge_queue WHERE admin_id = $1", user_id)
+        rows = await conn.fetch("SELECT file_content FROM merge_queue WHERE admin_id = $1", user.id)
 
     if not rows:
-        await status_msg.edit_text("❌ Queue expired or empty.")
+        await status_msg.edit_text("⚠️ Your merge queue is empty! Please send some `.txt` files first.")
         return
 
     try:
@@ -341,7 +285,8 @@ async def file_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
         output.close()
 
         total_lines = combined_text.count('\n')
-        formatted_name = f"@RatLogsCloud-{total_lines}-{file_type_str}.txt"
+        # İstenen yeni dosya formatı:
+        formatted_name = f"@CalcyCloud-{total_lines}.txt"
 
         raw_bytes = combined_text.encode('utf-8')
         file_bytes = BytesIO(raw_bytes)
@@ -350,10 +295,10 @@ async def file_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         # Telegram'a gönder
         sent_msg = await context.bot.send_document(
-            chat_id=user_id,
+            chat_id=user.id,
             document=file_bytes,
             filename=formatted_name,
-            caption=f"📁 <b>Merged File:</b> <code>{formatted_name}</code>\n📊 <b>Total Lines:</b> <code>{total_lines:,}</code>",
+            caption=f"📁 <b>File:</b> <code>{formatted_name}</code>\n📊 <b>Total Lines:</b> <code>{total_lines:,}</code>",
             parse_mode=ParseMode.HTML,
             read_timeout=60,
             write_timeout=60
@@ -373,9 +318,10 @@ async def file_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await conn.execute("""
             INSERT INTO files (file_code, user_id, file_id, file_type, file_name, file_size, download_count, caption, is_active)
             VALUES ($1, $2, $3, $4, $5, $6, 0, $7, 1)
-        """, file_code, user_id, telegram_file_id, 'document', formatted_name, file_size, formatted_name)
+        """, file_code, user.id, telegram_file_id, 'document', formatted_name, file_size, formatted_name)
 
-        await conn.execute("DELETE FROM merge_queue WHERE admin_id = $1", user_id)
+        # Kuyruğu sıfırla
+        await conn.execute("DELETE FROM merge_queue WHERE admin_id = $1", user.id)
 
     bot_username = context.bot.username
     download_url = f"https://t.me/{bot_username}?start=file_{file_code}"
@@ -392,13 +338,29 @@ async def file_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
         [InlineKeyboardButton("🔗 Share on Telegram", url=f"https://t.me/share/url?url={download_url}&text=Download%20File")]
     ])
 
+    await status_msg.delete()
     await context.bot.send_message(
-        chat_id=user_id,
+        chat_id=user.id,
         text=resp,
         reply_markup=kb,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True
     )
+
+
+async def merge_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    if not is_admin(user_id):
+        return
+
+    await query.answer()
+    data = query.data
+
+    if data == "merge_clear":
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM merge_queue WHERE admin_id = $1", user_id)
+        await query.edit_message_text("🗑️ Merge queue cleared.")
 
 
 # ==============================================================================
@@ -461,11 +423,9 @@ async def main():
     application.add_handler(CommandHandler("admin", admin_panel))
     application.add_handler(CommandHandler("merge", merge_command_handler))
     
-    # DÜZELTİLEN YER: Buton filtreleri kesinleştirildi
     application.add_handler(CallbackQueryHandler(check_sub_callback, pattern="^check_sub$"))
     application.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin_"))
     application.add_handler(CallbackQueryHandler(merge_callbacks, pattern="^merge_"))
-    application.add_handler(CallbackQueryHandler(file_type_selected, pattern="^type_"))
     
     application.add_handler(MessageHandler(filters.Document.ALL & filters.User(user_id=ADMIN_IDS), handle_incoming_file))
 
